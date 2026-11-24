@@ -1,0 +1,331 @@
+\documentclass[conference]{IEEEtran}
+\IEEEoverridecommandlockouts
+
+\usepackage[T1]{fontenc}
+\usepackage{cite}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{xcolor}
+\usepackage[hidelinks]{hyperref}
+\usepackage{url}
+
+\graphicspath{{figures/}}
+
+\begin{document}
+
+\title{NOVA-Net: Exploratory Analysis of Open Food Facts\\for Predicting Food Processing Level}
+
+\author{
+\IEEEauthorblockN{Omar Ahmed Elwekeil}
+\IEEEauthorblockA{\textit{Artificial Intelligence Program} \\
+\textit{Egypt-Japan University of Science and Technology}\\
+Alexandria, Egypt \\
+ID: 320230172}
+\and
+\IEEEauthorblockN{Ahmed Abdelmaksoud}
+\IEEEauthorblockA{\textit{Artificial Intelligence Program} \\
+\textit{Egypt-Japan University of Science and Technology}\\
+Alexandria, Egypt \\
+ID: 320230212}
+}
+
+\maketitle
+
+\begin{abstract}
+Ultra-processed foods are associated with obesity, type 2 diabetes and cardiovascular disease, yet most packaged products carry no processing label. The NOVA system rates processing from 1 (unprocessed) to 4 (ultra-processed), but only 23.3\% of the 4.8 million products in the Open Food Facts database have a NOVA group. This paper presents the first phase of NOVA-Net, a project that aims to predict a product's NOVA group from its nutrition facts, ingredient text and category tags. We analyse the 993,157 United States products in the database, of which 388,530 are labeled. The classes are strongly imbalanced (70.5\% NOVA~4 against 2.5\% NOVA~2). Ingredient-derived inputs are missing for about 1\% of labeled products but 88\% of unlabeled ones, because Open Food Facts computes NOVA with a rule-based formula over ingredients and categories. We also find a copy of the target hidden inside the nested nutrient records, impossible nutrient values in up to 4\% of products, and very sparse text features (35,432 TF-IDF terms at 0.17\% density). Silhouette scores near zero in PCA and LDA projections show that the classes overlap in nutrient space, while mutual information confirms that nutrients still carry nonlinear signal. We release a cleaned, leakage-free dataset and derive concrete requirements for the modelling phase: macro-averaged metrics, class weighting, ablations of formula-related features, and a separate nutrition-only setting.
+\end{abstract}
+
+\begin{IEEEkeywords}
+food processing, NOVA classification, ultra-processed food, Open Food Facts, exploratory data analysis, class imbalance, data leakage, dimensionality reduction
+\end{IEEEkeywords}
+
+%% =========================================================
+\section{Introduction}
+
+Diets high in ultra-processed food are linked to a wide range of adverse health outcomes, including obesity, type 2 diabetes, cardiovascular disease and all-cause mortality~\cite{lane2024bmj}. The NOVA classification~\cite{monteiro2019nova} groups foods by the extent and purpose of their industrial processing into four classes: (1) unprocessed or minimally processed foods, (2) processed culinary ingredients such as oils, sugar and salt, (3) processed foods, and (4) ultra-processed foods. Unlike nutrient-based scores, NOVA is not printed on packages, so consumers, researchers and public-health agencies cannot easily know how processed a product is.
+
+Open Food Facts (OFF)~\cite{off} is a non-profit, crowd-sourced database of packaged foods that assigns a NOVA group to products where enough information is available. In the current export, however, only 1,120,043 of 4,807,583 products (23.3\%) have one. A model that predicts NOVA from the information that \emph{is} available could label the remaining products and support large-scale dietary research.
+
+The NOVA-Net project builds such a model. This paper reports its first phase: a full exploratory analysis of the United States subset of OFF. Our contributions are:
+\begin{itemize}
+    \item A reproducible pipeline that loads the 7.7\,GB Parquet export with DuckDB, flattens nested nutrient records and produces a cleaned, leakage-free table of 993,157 US products.
+    \item A quantitative study of the challenges listed in our proposal: class imbalance, missing values, noisy text, correlated nutrients, high-cardinality categories and sparse high-dimensional text.
+    \item Two findings that change the modelling plan: a copy of the label hidden inside the nutrient records, and evidence that unlabeled products mostly lack the inputs a model needs because OFF derives NOVA from ingredients.
+    \item A class-separation analysis (PCA, LDA, silhouette, mutual information) showing that the classes overlap in nutrient space but carry nonlinear signal.
+\end{itemize}
+
+%% =========================================================
+\section{Related Work}
+
+Monteiro \emph{et al.}~\cite{monteiro2019nova} define the NOVA groups and the ``markers'' of ultra-processing, such as cosmetic additives (colours, flavours, emulsifiers) and industrial ingredients (hydrolysed proteins, maltodextrin, invert sugar). OFF implements a version of these rules: a product starts in group~1 and moves to group~2, 3 or 4 when its categories or ingredients match marker lists~\cite{offnova}. As a result, the NOVA labels in OFF are themselves the output of a deterministic procedure, a fact that matters for any model trained on them (Section~\ref{sec:discussion}).
+
+Menichetti \emph{et al.}~\cite{menichetti2023foodprox} showed that the degree of processing can be predicted from nutrient concentrations alone with a random-forest classifier (FoodProX), using manually classified foods from US dietary surveys. Our work differs in the data source (a crowd-sourced database of branded products) and in the inputs, which combine nutrients with ingredient text and category tags. This phase focuses on understanding the data before any modelling.
+
+%% =========================================================
+\section{Dataset}
+
+We use the official OFF Parquet export hosted on Hugging Face~\cite{offhf} (file \texttt{food.parquet}, 7.7\,GB, 111 columns, Open Database License). Each row is one packaged product with its barcode, name, brand, ingredient list, nutrient table, categories, labels, additives, allergens and packaging. The target is \texttt{nova\_group} $\in \{1,2,3,4\}$.
+
+We keep products whose \texttt{countries\_tags} list contains \texttt{en:united-states}. The US is the country with the most labeled products (388,530, or 39.1\% of its 993,157 products), ahead of France (about 306,000). The labeled products form the modelling table; the 604,627 unlabeled products are kept to study the population the model would be applied to. Because the export is refreshed regularly, counts may shift slightly between downloads.
+
+%% =========================================================
+\section{Methodology}
+
+\subsection{Loading and flattening}
+The Parquet file is queried with DuckDB~\cite{duckdb}, which reads only the requested columns and keeps memory within a free Colab instance. Nutrients are stored as a list of records \{\textit{name}, \textit{value}, \textit{100g}, \textit{unit}, \dots\}; we pivot the nine core nutrients (energy, fat, saturated fat, carbohydrates, sugars, fiber, proteins, salt, sodium) and the most frequent others into 20 per-100\,g columns. Multilingual fields (product name, ingredient text) are reduced to one string, preferring English and falling back to the product's main language. Tag columns are kept as lists.
+
+\subsection{Target leakage}
+Three fields copy the label: \texttt{nova\_groups}, \texttt{nova\_groups\_tags}, and a \texttt{nova-group} entry inside the nutrient list, present for 96\% of labeled products. A naive flattening of the most frequent nutrients would include this entry as a feature. All three are excluded, as is \texttt{nutrition-score-fr}, a score that OFF computes from the nutrients.
+
+\subsection{Exploratory analysis}
+We measure (i) the class distribution; (ii) the missing rate of every feature for labeled and unlabeled products, counting \texttt{NULL}, empty strings, empty lists and placeholders (\texttt{unknown}, \texttt{en:undefined}) as missing; (iii) which inputs unlabeled products contain; (iv) nutrient ranges and rule violations; (v) nutrients and counts by class; (vi) Spearman correlations between numeric features and with the ordinal target; (vii) ingredient-text quality and class-specific vocabulary; (viii) the cardinality of tag columns; (ix) the dimensionality of TF-IDF text features (1--2-grams, 60,000-product sample) with truncated SVD, and PCA on the standardised core nutrients; and (x) class separation.
+
+For class separation we project the nine standardised core nutrients (25,000 products, median-imputed, clipped at the 99.5th percentile) with PCA and with linear discriminant analysis (LDA). We compute the silhouette score of the NOVA classes,
+\begin{equation}
+s = \frac{1}{N}\sum_{i=1}^{N}\frac{b_i - a_i}{\max(a_i, b_i)},
+\end{equation}
+where $a_i$ is the mean distance from point $i$ to points of its own class and $b_i$ the mean distance to the nearest other class, on a balanced sample of 1,500 products per class. A score near 0 indicates overlapping classes. We also estimate the mutual information $I(X_j; Y)$ between each feature and the class with a nearest-neighbour estimator~\cite{sklearn}, which captures nonlinear dependence.
+
+\subsection{Cleaning}
+Impossible nutrient values are set to missing rather than removing the product, so its text and categories remain usable. A value is impossible if it is negative, exceeds 100\,g per 100\,g, or exceeds 900\,kcal (3,800\,kJ). Saturated fat above total fat and sugars above carbohydrates (both with a 0.5\,g tolerance) are also removed, and fat, carbohydrates and proteins are all removed when their sum exceeds 105\,g. Imputation and scaling are deferred to the modelling phase and will be fitted inside training folds to avoid leakage.
+
+%% =========================================================
+\section{Results}
+
+\subsection{Class imbalance}
+Table~\ref{tab:classes} and Fig.~\ref{fig:classes} show the class distribution. NOVA~4 dominates with 70.5\% of labeled products, while NOVA~2 has only 2.5\%, an imbalance ratio of 28. A classifier that always predicts NOVA~4 would reach 70.5\% accuracy without learning anything.
+
+\begin{table}[t]
+\centering
+\caption{NOVA class distribution, labeled US products}
+\label{tab:classes}
+\begin{tabular}{llrr}
+\toprule
+Group & Description & Products & Share \\
+\midrule
+1 & Unprocessed / minimally processed & 38,425 & 9.9\% \\
+2 & Processed culinary ingredients & 9,738 & 2.5\% \\
+3 & Processed foods & 66,432 & 17.1\% \\
+4 & Ultra-processed foods & 273,935 & 70.5\% \\
+\midrule
+ & Total & 388,530 & 100\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{class_distribution.png}
+\caption{NOVA group distribution of the 388,530 labeled US products.}
+\label{fig:classes}
+\end{figure}
+
+\subsection{Missing values and the unlabeled population}
+Fig.~\ref{fig:missing} compares missing rates for labeled and unlabeled products. Among labeled products, packaging (98\%) and labels (83\%) are almost empty; core nutrients are missing for 6--21\% and minor nutrients for 23--78\%. Ingredient text, and the ingredient and additive counts derived from it, are missing for only 1.1\% of labeled products but for 88\% of unlabeled ones.
+
+Breaking down the unlabeled products by available inputs makes the consequence clear. Of the 604,627 unlabeled US products, only 69,953 (11.6\%) have ingredient text, 394,871 (65.3\%) have nutrition facts but neither ingredients nor categories, and 94,718 (15.7\%) have no ingredients, categories or nutrition at all.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{missingness.png}
+\caption{Missing rate per feature for labeled and unlabeled US products. Ingredient-derived features show the largest gap.}
+\label{fig:missing}
+\end{figure}
+
+\subsection{Impossible values}
+Table~\ref{tab:impossible} lists the most frequent rule violations among labeled products. Raw maxima reach $10^{10}$\,g of sugar per 100\,g, clearly entry errors. After cleaning, every core nutrient lies in $[0, 100]$\,g and energy in $[0, 900]$\,kcal; about 15,500 values (4.0\%) of fat, carbohydrates and proteins were set to missing.
+
+\begin{table}[t]
+\centering
+\caption{Most frequent impossible values (labeled US products)}
+\label{tab:impossible}
+\begin{tabular}{lrr}
+\toprule
+Rule violated (per 100\,g) & Products & Share \\
+\midrule
+Fat + carbohydrates + proteins $>$ 105\,g & 15,441 & 4.0\% \\
+Energy $>$ 900\,kcal & 11,277 & 2.9\% \\
+Carbohydrates $>$ 100\,g & 10,452 & 2.7\% \\
+Sugars $>$ 100\,g & 5,103 & 1.3\% \\
+Fat $>$ 100\,g & 4,669 & 1.2\% \\
+Proteins $>$ 100\,g & 907 & 0.2\% \\
+Sugars $>$ carbohydrates + 0.5\,g & 603 & 0.2\% \\
+Saturated fat $>$ fat + 0.5\,g & 410 & 0.1\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Nutrients and counts by class}
+Fig.~\ref{fig:nutrients} shows the core nutrients by NOVA group. NOVA~2 stands apart (median 643\,kcal and 64\,g fat per 100\,g, reflecting oils and fats), while NOVA~3 and~4 have similar fat and energy but differ in sugars and carbohydrates. The ingredient and additive counts separate the classes far more clearly (Fig.~\ref{fig:counts}): NOVA~4 products have a median of 18 ingredients and 3 additives, NOVA~1 products a median of 2 ingredients and none.
+
+\begin{figure*}[t]
+\centering
+\includegraphics[width=0.85\textwidth]{nutrients_by_nova.png}
+\caption{Core nutrients per 100\,g by NOVA group (outliers hidden).}
+\label{fig:nutrients}
+\end{figure*}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{counts_by_nova.png}
+\caption{Number of ingredients and additives by NOVA group.}
+\label{fig:counts}
+\end{figure}
+
+\subsection{Correlations and feature relevance}
+Fig.~\ref{fig:corr} shows the Spearman correlation matrix. Salt and sodium are almost identical ($\rho = 0.995$), since OFF derives one from the other; saturated fat and fat ($\rho = 0.86$) and fat and energy ($\rho = 0.73$) are also strongly correlated. Table~\ref{tab:relevance} ranks features by their relation to the target. The ingredient and additive counts have the highest Spearman correlation and mutual information; among nutrients, salt, energy and carbohydrates carry the most information.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{spearman_corr.png}
+\caption{Spearman correlation among numeric features (labeled US products).}
+\label{fig:corr}
+\end{figure}
+
+\begin{table}[t]
+\centering
+\caption{Relation of numeric features to the NOVA group}
+\label{tab:relevance}
+\begin{tabular}{lrr}
+\toprule
+Feature & Spearman $\rho$ & MI (nats) \\
+\midrule
+Ingredient count & 0.61 & 0.29 \\
+Additive count & 0.65 & 0.28 \\
+Salt & 0.23 & 0.16 \\
+Energy (kcal) & 0.08 & 0.15 \\
+Carbohydrates & 0.18 & 0.15 \\
+Fat & 0.08 & 0.14 \\
+Sugars & 0.25 & 0.12 \\
+Proteins & $-0.01$ & 0.12 \\
+Saturated fat & 0.16 & 0.10 \\
+Fiber & $-0.12$ & 0.06 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Ingredient text}
+US ingredient text is almost entirely English: only 0.1\% of texts have more than 5\% non-ASCII characters. It is noisy in other ways: 14.1\% of texts are mostly upper case, 2.9\% are shorter than 15 characters, and 18\% duplicate another product's text exactly. Text length grows with processing, from a median of 4 words for NOVA~1 to 36 for NOVA~4 (Fig.~\ref{fig:text}). The most over-represented words per class are interpretable: \emph{organic, broccoli, beans} (NOVA~1); \emph{olive, virgin, honey} (NOVA~2); \emph{salt, sea, garlic} (NOVA~3); \emph{natural, flavor, syrup, gum, starch} (NOVA~4).
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{text_length.png}
+\caption{Left: words in the ingredient text by NOVA group. Right: distribution of text length ($\log_{10}$ characters).}
+\label{fig:text}
+\end{figure}
+
+\subsection{High-cardinality categoricals}
+Table~\ref{tab:cardinality} summarises the tag columns. Brands are extremely fragmented (41,629 values, the top 100 covering only 24\%), and 33,585 labeled products carry only the placeholder category \texttt{en:undefined}. Fig.~\ref{fig:categories} shows the NOVA mix inside the 30 most common categories: some categories are almost pure (e.g., sweet snacks), while others such as plant-based foods mix all four groups.
+
+\begin{table}[t]
+\centering
+\caption{Cardinality of categorical features (labeled US products)}
+\label{tab:cardinality}
+\begin{tabular}{lrrr}
+\toprule
+Feature & Distinct & Empty & Top-100 cover \\
+\midrule
+Brands & 41,629 & 33.2\% & 24.0\% \\
+Categories & 9,844 & 11.5\% & 83.1\% \\
+Labels & 2,474 & 82.9\% & 95.1\% \\
+Packaging & 1,208 & 97.9\% & 82.6\% \\
+Allergens & 543 & 36.8\% & 99.9\% \\
+Additives & 515 & 32.2\% & 93.1\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.9\columnwidth]{category_nova_mix.png}
+\caption{Share of each NOVA group inside the 30 most common categories.}
+\label{fig:categories}
+\end{figure}
+
+\subsection{Dimensionality and class separation}
+TF-IDF on ingredient text produces 35,432 features with only 0.17\% non-zero entries, and the first 100 SVD components retain just 24.5\% of the variance (Fig.~\ref{fig:svd}). The nine core nutrients are far more compact: five principal components retain 93\% of their variance (PC1: 34\%).
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.9\columnwidth]{svd_variance.png}
+\caption{Cumulative explained variance of truncated SVD on TF-IDF ingredient features (60,000-product sample).}
+\label{fig:svd}
+\end{figure}
+
+Fig.~\ref{fig:pcalda} compares the PCA and LDA projections of the nutrients, and Table~\ref{tab:silhouette} reports the silhouette scores. All are close to zero or negative: even LDA, which seeks the most discriminative directions, does not separate the classes. Mutual information (Table~\ref{tab:relevance}) is nevertheless clearly positive for most nutrients, so the signal exists but is nonlinear.
+
+\begin{figure*}[t]
+\centering
+\includegraphics[width=0.85\textwidth]{pca_vs_lda.png}
+\caption{Core nutrients projected to two dimensions with PCA (left, unsupervised) and LDA (right, supervised), coloured by NOVA group.}
+\label{fig:pcalda}
+\end{figure*}
+
+\begin{table}[t]
+\centering
+\caption{Silhouette score of the NOVA classes (balanced sample)}
+\label{tab:silhouette}
+\begin{tabular}{lr}
+\toprule
+Feature space & Silhouette \\
+\midrule
+Nine standardised nutrients & 0.002 \\
+PCA, 2 components & $-0.047$ \\
+LDA, 2 components & $-0.011$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+%% =========================================================
+\section{Discussion}
+\label{sec:discussion}
+
+\textbf{The label is rule-generated.} Because OFF computes NOVA from ingredient and category markers~\cite{offnova}, features such as the additive count or the additive tags are inputs of the labelling formula. Their high relevance (Table~\ref{tab:relevance}) is partly a reflection of that formula. A model using them can still fill missing labels, but its accuracy will overstate how well processing can be inferred from a product's composition. We will therefore report ablations with and without these features and a nutrition-only model.
+
+\textbf{A missing label usually means missing ingredients.} The 88\% versus 1.1\% gap in ingredient text explains why most products are unlabeled. The realistic use case is narrower than ``label every product'': text-based models can serve about 70,000 unlabeled US products, a nutrition-only model about 395,000 more, and about 95,000 products offer nothing to predict from. The nutrition-only setting is the hardest, given the overlap in Fig.~\ref{fig:pcalda}, and is also where such a model would add the most value.
+
+\textbf{Evaluation must account for imbalance.} With a 28:1 ratio, accuracy is misleading. We will use stratified splits, class weights, macro-F1 and per-class recall. NOVA~2 is the most vulnerable class: it is the smallest and the one most often missing ingredient text (36\%), although its nutrient profile is distinctive.
+
+\textbf{Text is informative but high-dimensional.} The class-specific vocabulary confirms that ingredient text carries strong signal, but its variance is spread over many directions, so reduction will need hundreds of SVD components or models that work on sparse input directly.
+
+\textbf{Limitations.} The analysis covers only US products, whose text is almost all English; other countries will add multilingual noise. The labels are produced by an automatic, experimental formula and inherit its errors. Duplicate ingredient texts (18\%) may inflate test scores if near-identical products fall on both sides of a split.
+
+%% =========================================================
+\section{Conclusion and Future Work}
+
+This first phase of NOVA-Net characterised the United States subset of Open Food Facts for predicting food processing level. All challenges anticipated in our proposal were confirmed, and two new findings were added: a copy of the target hidden in the nested nutrient records, now removed, and the dependence of the labels on ingredient availability. The classes overlap in nutrient space but carry nonlinear signal, and the strongest features are tied to the labelling formula.
+
+The next phase will encode the features (TF-IDF, multi-hot tags, imputation with missing-value flags, all fitted inside training folds), apply the planned dimensionality-reduction methods (SVD, PCA, Kernel-PCA, LDA, SNE, t-SNE and UMAP), and train baseline, nonlinear and combined text--numeric classifiers evaluated with macro-F1 and ablations by feature group. Later phases will extend the analysis to other countries.
+
+%% =========================================================
+\begin{thebibliography}{9}
+
+\bibitem{lane2024bmj}
+M.~M. Lane \emph{et al.}, ``Ultra-processed food exposure and adverse health outcomes: umbrella review of epidemiological meta-analyses,'' \emph{BMJ}, vol.~384, e077310, 2024.
+
+\bibitem{monteiro2019nova}
+C.~A. Monteiro \emph{et al.}, ``Ultra-processed foods: what they are and how to identify them,'' \emph{Public Health Nutrition}, vol.~22, no.~5, pp.~936--941, 2019.
+
+\bibitem{off}
+Open Food Facts, ``Open Food Facts -- the free food products database.'' [Online]. Available: \url{https://world.openfoodfacts.org/data}
+
+\bibitem{offnova}
+Open Food Facts, ``NOVA groups for food processing.'' [Online]. Available: \url{https://world.openfoodfacts.org/nova}
+
+\bibitem{offhf}
+Open Food Facts, ``Product database (Parquet export),'' Hugging Face Datasets. [Online]. Available: \url{https://huggingface.co/datasets/openfoodfacts/product-database}
+
+\bibitem{menichetti2023foodprox}
+G.~Menichetti, B.~Ravandi, D.~Mozaffarian, and A.-L. Barab\'asi, ``Machine learning prediction of the degree of food processing,'' \emph{Nature Communications}, vol.~14, art.~2312, 2023.
+
+\bibitem{duckdb}
+M.~Raasveldt and H.~M\"uhleisen, ``DuckDB: an embeddable analytical database,'' in \emph{Proc. ACM SIGMOD Int. Conf. Management of Data}, 2019, pp.~1981--1984.
+
+\bibitem{sklearn}
+F.~Pedregosa \emph{et al.}, ``Scikit-learn: Machine learning in Python,'' \emph{Journal of Machine Learning Research}, vol.~12, pp.~2825--2830, 2011.
+
+\end{thebibliography}
+
+\end{document}
